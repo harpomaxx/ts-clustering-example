@@ -1,0 +1,206 @@
+---
+title: "Clustering with time-series"
+output: html_notebook
+---
+
+```{r}
+library(dplyr)
+library(readr)
+library(tsibble)
+library(lubridate)
+library(ggplot2)
+library(purrr)
+library(dtwclust)
+library(RColorBrewer)
+```
+
+```{r}
+sta_data<-
+  readr::read_csv(
+    "https://github.com/harpomaxx/ts-clustering-example/raw/main/data/stations_data.csv.gz",
+    col_types = cols(
+      station = col_character(),
+      datetime = col_datetime(format = ""),
+      air_temp = col_double(),
+      drew_point = col_double(),
+      solar_rad_wm2 = col_double(),
+      humidity = col_double(),
+      wind_speed_kmh = col_double(),
+      wind_direction_deg = col_integer(),
+      ET0_mm = col_double(),
+      pp_mm = col_double()
+))
+```
+
+```{r}
+sta_weekly <-
+    sta_data %>% group_by(station) %>%
+    mutate(datetime = lubridate::floor_date(datetime, "week")) %>% 
+  ungroup()
+ 
+sta_weekly <-
+    sta_weekly %>% group_by(station, datetime) %>%
+    summarise_if(is.numeric, mean, na.rm = TRUE)
+
+sta_weekly_melted<-sta_weekly %>% 
+  mutate(datetime = tsibble::yearweek(datetime)) %>% 
+    tidyr::pivot_longer(3:ncol(sta_weekly), names_to = "variable")
+sta_weekly_melted
+```
+
+```{r}
+
+plot <-sta_weekly_melted %>% 
+  filter(year(datetime) %in% c("2018","2019")) %>%
+    ggplot() +
+    facet_grid(variable ~ station, scales = 'free_y') +
+    geom_tile(aes(
+      x = year(datetime) %>% as.factor(),
+      y = week(datetime),
+      fill = value,
+      alpha = 0.5
+    )) +
+    theme_bw()+
+    xlab("Year") + ylab("Week of the year") +
+    theme(axis.text.x = element_text(
+      angle = 45,
+      vjust = 0.5,
+      hjust = 1
+    )) +
+    scale_fill_gradient(low = "yellow", high = "red") +
+    theme(
+      axis.title.x = element_blank(),
+      legend.position = 'none')
+
+  plot
+```
+
+
+
+```{r}
+sta_data_filtered <-
+  sta_data %>%
+  mutate(datetime = lubridate::floor_date(datetime, unit = "1 day")) %>% 
+  group_by(station, datetime) %>%  
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE, ))) %>% 
+  ungroup()
+
+sta_data_filtered  <- sta_data_filtered %>%
+  mutate(datetime = as.Date(datetime)) %>% 
+  as_tsibble(index = datetime,
+             key = station,
+             regular = TRUE)
+```
+
+```{r}
+library(feasts)
+library(tsfeatures)
+
+air_temp_stability <- sta_data_filtered %>% 
+  features(air_temp,stability) %>% 
+  select(station,stability) 
+
+
+air_temp_lumpiness <- sta_data_filtered %>% 
+  features(air_temp,lumpiness ) %>% 
+  pull(lumpiness)  
+  
+  
+cbind(air_temp_stability,
+      air_temp_lumpiness ) %>% 
+  as_tibble()
+```
+
+```{r}
+air_temp_acf <- sta_data_filtered %>% 
+  features(air_temp,acf_features ) %>% select(x_acf1,x_acf10)
+
+air_temp_stl <- sta_data_filtered %>% 
+  features(air_temp,stl_features ) %>% select(trend,spike, linearity, curvature)
+
+air_temp_tsfeatures <- cbind(
+    air_temp_stability,
+      lumpiness = air_temp_lumpiness,
+      air_temp_stl,
+      air_temp_acf
+      ) %>% as_tibble()
+
+air_temp_tsfeatures
+```
+
+```{r}
+kmeans_results<-kmeans(air_temp_tsfeatures,centers =5, 
+                       nstart = 1, 
+                       iter.max = 10)
+cbind(air_temp_tsfeatures,cluster=kmeans_results$cluster) %>% 
+select(station,cluster)
+```
+
+
+```{r}
+## Group by day and average
+sta_data <- sta_data %>%
+  mutate(datetime = lubridate::floor_date(datetime, 
+                                          unit = "1 day")) %>% 
+  group_by(station, datetime) %>% 
+  summarise(avg_hour=mean(air_temp,na.rm=TRUE)
+  ) %>% ungroup() 
+```
+```{r}
+## replace nan by NA
+sta_data <-
+  sta_data %>% mutate_if(is.numeric,  ~ ifelse(is.nan(.), NA, .))
+# transfor dataframe to matrix
+sta_series <- sta_data %>%
+  as_tibble() %>% select(station, datetime, avg_hour) %>%
+  group_by(station) %>%
+  tidyr::fill(avg_hour, .direction = "downup") %>%
+  ungroup() %>%
+  group_split(station, .keep = FALSE) %>%
+  map( ~ .x %>%
+         pull(avg_hour))
+
+## print the first then observation from station 1
+sta_series[[1]][1:10]
+```
+
+```{r}
+
+## reinterpolate (only necesary for for L1)
+#sta_series <-
+#  reinterpolate(sta_matrix, new.length = max(lengths(sta_matrix)))
+## Clustering 
+univariate_clusters <- tsclust(
+  sta_series,
+  k = 4,
+  type = "partitional",
+  distance = "dtw_basic",
+  centroid = "pam", # fast method
+  seed = 3247,
+  trace = TRUE,
+  control = partitional_control(nrep = 1L)
+)
+```
+
+
+```{r}
+
+## gather the information about stations and set list names
+sta_lst_labels<-sta_data %>% as_tibble() %>% 
+  select(station) %>% unique() %>% 
+  unname() %>% unlist()
+names(sta_series)<-sta_lst_labels
+
+## print the table with clustering information
+cbind(cluster=univariate_clusters@cluster,
+      station=names(sta_series)) %>% 
+  as.data.frame() %>% 
+  arrange(station)
+```
+```{r}
+heatmap(univariate_clusters@distmat,main = "Similarities between stations", 
+        col = colorRampPalette(brewer.pal(9, "Blues"))(16),
+        cexRow = 1,cexCol = 1,
+        symm = TRUE)
+```
+
